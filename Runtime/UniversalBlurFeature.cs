@@ -1,151 +1,137 @@
+using System;
+using Unified.UniversalBlur.Runtime.CommandBuffer;
+using Unified.UniversalBlur.Runtime.PassData;
 using UnityEngine;
+using UnityEngine.Experimental.Rendering;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
 
+#if UNITY_6000_0_OR_NEWER
+using UnityEngine.Rendering.RenderGraphModule;
+#endif
+
 namespace Unified.UniversalBlur.Runtime
 {
-    public class UniversalBlurFeature : ScriptableRendererFeature
+    internal class UniversalBlurPass : ScriptableRenderPass, IDisposable
     {
-        [Header("Blur Settings")]
-        [Range(1, 12)] [SerializeField] private int iterations = 4;
-        [Range(1f, 10f)] [SerializeField] private float downsample = 2.0f;
-        
-        [Tooltip("Enable mipmaps for more efficient blur")]
-        [SerializeField] private bool enableMipMaps = true;
-        // [Range(0f, 10f)] 
-        [SerializeField] private float scale = 1f;
-        // [Range(0f, 10f)] 
-        [SerializeField] private float offset = 1f;
-        
-        [Space]
-        
-        [Header("Advanced Settings")]
-        [SerializeField] private ScaleBlurWith scaleBlurWith = ScaleBlurWith.ScreenHeight;
-        [SerializeField] private float scaleReferenceSize = 1080f;
-        
-        [Space]
-        
-        // [SerializeField, ShowAsPass(nameof(_material))] public int shaderPass;
-        [SerializeField] private BlurType blurType;
-        
-        [Tooltip("For Overlay Canvas: AfterRenderingPostProcessing" +
-                 "\n\nOther: BeforeRenderingTransparents (will hide transparents)")]
-        [SerializeField] private RenderPassEvent injectionPoint = RenderPassEvent.AfterRenderingPostProcessing;
-        
-        private float _intensity = 1.0f;
-        
-        [SerializeField]
-        [HideInInspector]
-        [Reload("Shaders/Blur.shader")]
-        private Shader shader;
-        
-        private Material _material;
-        private UniversalBlurPass _blurPass;
-        private float _renderScale; 
-        
-        // Avoid changing intensity value, but useful for transitions
-        public float Intensity
+        private const string k_PassName = "Universal Blur";
+        private const string k_BlurTextureSourceName = k_PassName + " - Blur Source";
+        private const string k_BlurTextureDestinationName = k_PassName + " - Blur Destination";
+
+        private readonly ProfilingSampler _profilingSampler;
+        private readonly MaterialPropertyBlock _propertyBlock;
+
+        private BlurConfig _blurConfig;
+        private RTHandle _sourceRT;
+        private RTHandle _destinationRT;
+
+        public UniversalBlurPass()
         {
-            get => _intensity;
-            set => _intensity = Mathf.Clamp(value, 0f, 1f);
+            _profilingSampler = new(k_PassName);
+            _propertyBlock = new();
         }
 
-        /// <inheritdoc/>
-        public override void Create()
+        public void Setup(BlurConfig blurConfig)
         {
-            _blurPass = new UniversalBlurPass();
-            _blurPass.renderPassEvent = injectionPoint;
+            _blurConfig = blurConfig;
+
+            // declare the need for intermediate texture
+            ConfigureInput(ScriptableRenderPassInput.Color);
         }
 
-        /// <inheritdoc/>
-        public override void OnCameraPreCull(ScriptableRenderer renderer, in CameraData cameraData)
+        public void Dispose()
         {
-            base.OnCameraPreCull(renderer, in cameraData);
-            _renderScale = cameraData.renderScale;
+            // Nothing to dispose
         }
 
-        /// <inheritdoc/>
-        public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
+        public void DrawDefaultTexture()
         {
-            if (!TrySetShadersAndMaterials())
+            // For better preview experience in editor, we just use a gray texture
+            Shader.SetGlobalTexture(Constants.GlobalFullScreenBlurTextureId, Texture2D.linearGrayTexture);
+        }
+
+        private RenderTextureDescriptor GetDescriptor() =>
+            new(_blurConfig.Width, _blurConfig.Height, GraphicsFormat.B10G11R11_UFloatPack32, 0)
             {
-                Debug.LogErrorFormat("{0}.AddRenderPasses(): Missing material. {1} render pass will not be added.", GetType().Name, name);
-                return;
-            }
-            
-            // Important to halt rendering here if camera is different, otherwise render textures will detect descriptor changes
-            if (renderingData.cameraData.isPreviewCamera ||
-                (renderingData.cameraData.isSceneViewCamera))
-            {
-                _blurPass.DrawDefaultTexture();
-                
-                return;
-            }
-            
-            var passData = GetBlurConfig(renderingData);
-            
-            _blurPass.Setup(passData);
-            
-            renderer.EnqueuePass(_blurPass);
-        }
-
-        /// <inheritdoc/>
-        protected override void Dispose(bool disposing)
-        {
-            _blurPass?.Dispose();
-            CoreUtils.Destroy(_material);
-        }
-    
-        private bool TrySetShadersAndMaterials()
-        {
-            if (shader == null) 
-                shader = Shader.Find("Unify/Internal/Blur");
-            
-            if (_material == null && shader != null)
-                _material = CoreUtils.CreateEngineMaterial(shader);
-            
-            return _material != null;
-        }
-        
-        private BlurConfig GetBlurConfig(in RenderingData renderingData)
-        {
-            var (width, height) = GetTargetResolution(renderingData);
-            
-            return new BlurConfig
-            {
-                Scale = CalculateScale(),
-                
-                Width = width,
-                Height = height,
-                
-                Material = _material,
-                Intensity = _intensity,
-                Downsample = downsample,
-                Offset = offset,
-                BlurType = blurType,
-                Iterations = iterations,
-                
-                EnableMipMaps = enableMipMaps
+                useMipMap = _blurConfig.EnableMipMaps,
+                autoGenerateMips = _blurConfig.EnableMipMaps
             };
-        }
 
-        private (int width, int height) GetTargetResolution(in RenderingData renderingData)
+#if !UNITY_6000_0_OR_NEWER
+        // Compatibility Mode (compiled on Unity versions before 6)
+        // In URP 17 no longer exposes this method, prevent CS0115 with !Unity.
+        public override void Execute(ScriptableRenderContext context, ref RenderingData renderingData)
         {
-            RenderTextureDescriptor descriptor = renderingData.cameraData.cameraTargetDescriptor;
-            
-            var width =
-                Mathf.RoundToInt(descriptor.width / downsample);
-            var height =
-                Mathf.RoundToInt(descriptor.height / downsample);
+            var cmd = CommandBufferPool.Get();
+            var descriptor = GetDescriptor();
 
-            return (width, height);
+            RenderingUtils.ReAllocateIfNeeded(ref _sourceRT, descriptor, FilterMode.Bilinear, TextureWrapMode.Clamp, name: k_BlurTextureSourceName);
+            RenderingUtils.ReAllocateIfNeeded(ref _destinationRT, descriptor, FilterMode.Bilinear, TextureWrapMode.Clamp, name: k_BlurTextureDestinationName);
+
+            var colorTarget = renderingData.cameraData.renderer.cameraColorTargetHandle;
+
+            using (new ProfilingScope(cmd, _profilingSampler))
+            {
+                BlurPasses.KawaseExecutePass(new LegacyPassData()
+                {
+                    BlurConfig = _blurConfig,
+                    MaterialPropertyBlock = _propertyBlock,
+                    ColorSource = colorTarget,
+                    Source = _sourceRT,
+                    Destination = _destinationRT
+                }, new WrappedCommandBuffer(cmd));
+
+                cmd.SetGlobalTexture(Constants.GlobalFullScreenBlurTextureId, _destinationRT);
+            }
+
+            context.ExecuteCommandBuffer(cmd);
+            CommandBufferPool.Release(cmd);
         }
-        
-        private float CalculateScale() => scaleBlurWith switch
+#endif
+
+        // RecordRenderGraph is the only execution path in URP 17
+#if UNITY_6000_0_OR_NEWER
+        public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
         {
-            ScaleBlurWith.ScreenHeight => scale * (Screen.height / scaleReferenceSize) * _renderScale,
-            ScaleBlurWith.ScreenWidth => scale * (Screen.width / scaleReferenceSize) * _renderScale,
-            _ => scale
-        };
+            var resourceData = frameData.Get<UniversalResourceData>();
+
+            if (resourceData.isActiveTargetBackBuffer)
+            {
+                Debug.LogError(
+                    "Skipping render pass. UniversalBlurPass requires an intermediate ColorTexture, we can't use the BackBuffer as a texture input.");
+                return;
+            }
+
+            var cameraColorSource = resourceData.activeColorTexture;
+
+            var descriptor = new TextureDesc(GetDescriptor());
+
+            descriptor.name = k_BlurTextureSourceName;
+            TextureHandle source = renderGraph.CreateTexture(descriptor);
+            descriptor.name = k_BlurTextureDestinationName;
+            TextureHandle destination = renderGraph.CreateTexture(descriptor);
+
+            using (var builder = renderGraph.AddUnsafePass<RenderGraphPassData>(k_PassName, out var passData, _profilingSampler))
+            {
+                passData.ColorSource = cameraColorSource;
+                passData.Source = source;
+                passData.Destination = destination;
+                passData.MaterialPropertyBlock = _propertyBlock;
+                passData.BlurConfig = _blurConfig;
+
+                builder.AllowPassCulling(false);
+
+                builder.UseTexture(source, AccessFlags.ReadWrite);
+                builder.UseTexture(destination, AccessFlags.ReadWrite);
+
+                builder.SetGlobalTextureAfterPass(destination, Constants.GlobalFullScreenBlurTextureId);
+
+                builder.SetRenderFunc<RenderGraphPassData>((data, ctx) =>
+                {
+                    BlurPasses.KawaseExecutePass(data, new WrappedUnsafeCommandBuffer(ctx.cmd));
+                });
+            }
+        }
+#endif
     }
 }
